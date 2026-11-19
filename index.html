@@ -54,6 +54,11 @@ button:focus-visible, .chip:focus-visible, input:focus-visible, summary:focus-vi
 .chip[aria-pressed="false"] { color: var(--text-muted); background: transparent; }
 .chip[aria-pressed="false"] .key { opacity: .25; }
 .key { display: inline-block; width: 16px; height: 2px; border-radius: 1px; background: currentColor; }
+select.chip { appearance: auto; padding: 5px 8px; }
+.custom-range { display: inline-flex; align-items: center; gap: 6px; }
+.custom-range[hidden] { display: none; }
+input[type="date"] { font: inherit; color: var(--text-primary); background: var(--surface-1);
+  border: 1px solid var(--border); border-radius: 8px; padding: 4px 8px; }
 .sep { width: 1px; align-self: stretch; background: var(--border); margin: 0 6px; }
 
 details.picker { position: static; }
@@ -112,6 +117,13 @@ svg .end-label { font-size: 11px; font-weight: 600; fill: var(--text-secondary);
   </header>
 
   <div class="filters" role="toolbar" aria-label="Filters">
+    <label class="label" for="rangeSel">Show</label>
+    <select class="chip" id="rangeSel"></select>
+    <span id="customRange" class="custom-range" hidden>
+      <input type="date" id="fromD" aria-label="From date"> <span class="label">to</span>
+      <input type="date" id="toD" aria-label="To date">
+    </span>
+    <span class="sep" aria-hidden="true"></span>
     <span class="label">Teams</span>
     <span id="teamChips" style="display:contents"></span>
     <span class="sep" aria-hidden="true"></span>
@@ -158,6 +170,21 @@ const state = {
   hover: null,
   tables: new Set(),
 };
+// ---- date range: presets count back from the newest data, not from today
+const PRESETS = [["3m", "Last 3 months", 3], ["6m", "Last 6 months", 6], ["12m", "Last 12 months", 12],
+                 ["all", "All", null], ["custom", "Custom…", null]];
+state.range = store.get("range", { preset: "6m" });
+if (!PRESETS.some(p => p[0] === state.range.preset)) state.range = { preset: "6m" };
+let RANGE = [DATES[0], DATES.at(-1)];
+function computeRange() {
+  const { preset, from, to } = state.range, last = DATES.at(-1);
+  if (preset === "all") return [DATES[0], last];
+  if (preset === "custom") return [from || DATES[0], to || last];
+  const months = PRESETS.find(p => p[0] === preset)[2];
+  const d = new Date(last + "T00:00:00"); d.setMonth(d.getMonth() - months);
+  return [d.toISOString().slice(0, 10), last];
+}
+const inRange = d => d >= RANGE[0] && d <= RANGE[1];
 if (!state.teams.size) D.teams.forEach(t => state.teams.add(t));
 if (!state.metrics.length) state.metrics = D.defaults.slice();
 
@@ -200,6 +227,29 @@ themeBtn.onclick = () => {
 };
 
 // ---------------------------------------------------------------- filters
+const rangeSel = document.getElementById("rangeSel"), customBox = document.getElementById("customRange");
+const fromD = document.getElementById("fromD"), toD = document.getElementById("toD");
+for (const [v, label] of PRESETS) rangeSel.append(el("option", { value: v, text: label }));
+for (const inp of [fromD, toD]) { inp.min = DATES[0]; inp.max = DATES.at(-1); }
+function applyRange() {
+  RANGE = computeRange();
+  rangeSel.value = state.range.preset;
+  customBox.hidden = state.range.preset !== "custom";
+  fromD.value = RANGE[0]; toD.value = RANGE[1];
+  store.set("range", state.range);
+}
+rangeSel.onchange = () => {
+  state.range = rangeSel.value === "custom" ? { preset: "custom", from: RANGE[0], to: RANGE[1] } : { preset: rangeSel.value };
+  applyRange(); renderAll();
+};
+for (const inp of [fromD, toD]) inp.onchange = () => {
+  if (!fromD.value || !toD.value) return;
+  const [a, b] = [fromD.value, toD.value].sort();
+  state.range = { preset: "custom", from: a, to: b };
+  applyRange(); renderAll();
+};
+applyRange();
+
 const chipsHost = document.getElementById("teamChips");
 for (const t of D.teams) {
   const b = el("button", { class: "chip", type: "button", "aria-pressed": String(state.teams.has(t)), title: t },
@@ -243,11 +293,11 @@ function renderSnapshot() {
   const host = document.getElementById("snapTable");
   const teams = activeTeams();
   document.getElementById("snapHint").textContent =
-    "Each team's most recent row, with the change since its previous snapshot.";
+    "Each team's most recent row in the selected range, with the change since its previous snapshot.";
   if (!teams.length || !state.metrics.length) { host.replaceChildren(el("div", { class: "empty", text: "Pick at least one team and one metric." })); return; }
   const head = el("tr", {}, el("th", { text: "Team" }), el("th", { text: "As of" }), state.metrics.map(m => el("th", { text: m })));
   const rows = teams.map(t => {
-    const ds = Object.keys(BY[t] || {}).sort();
+    const ds = Object.keys(BY[t] || {}).filter(inRange).sort();
     const last = ds.at(-1), prev = ds.at(-2);
     return el("tr", {},
       el("td", {}, el("span", { class: "team" }, el("span", { class: "key", style: `color:${color(t)}` }), el("span", { text: short(t) }))),
@@ -299,7 +349,7 @@ function renderCharts() {
 }
 
 function dataTable(m, teams) {
-  const rows = DATES.filter(d => teams.some(t => val(t, d, m) != null)).map(d =>
+  const rows = DATES.filter(d => inRange(d) && teams.some(t => val(t, d, m) != null)).map(d =>
     el("tr", {}, el("td", { text: fmtDate(d, 1) }), teams.map(t => el("td", { text: fmt(m, val(t, d, m)) }))));
   return el("div", { class: "data-table" }, el("table", {},
     el("thead", {}, el("tr", {}, el("th", { text: "Snapshot" }), teams.map(t => el("th", { text: short(t) })))),
@@ -310,9 +360,9 @@ function drawChart(card, m, teams) {
   const W = Math.max(280, card.clientWidth - 32), H = 226;
   const pad = { l: 44, r: 52, t: 10, b: 36 };
   const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, height: H, role: "img", "aria-label": `${m} over time by team` });
-  const series = teams.map(t => ({ t, pts: DATES.map(d => ({ d, v: val(t, d, m) })).filter(p => p.v != null) })).filter(s => s.pts.length);
+  const series = teams.map(t => ({ t, pts: DATES.filter(inRange).map(d => ({ d, v: val(t, d, m) })).filter(p => p.v != null) })).filter(s => s.pts.length);
   if (!series.length) {
-    card.append(el("div", { class: "empty", text: "No data for the selected teams." }));
+    card.append(el("div", { class: "empty", text: "No data for the selected teams in this date range." }));
     return { m, set() {} };
   }
   const all = series.flatMap(s => s.pts.map(p => p.v));
